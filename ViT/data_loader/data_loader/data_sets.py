@@ -63,7 +63,7 @@ class SimSatelliteDataset:
         if training:
             pkl_file = "training.pkl"
             # pkl_file = "training_full.pkl"
-            # pkl_file = "training_small.pkl"
+            #  pkl_file = "training_small.pkl"
         else:
             pkl_file = "validation.pkl"
 

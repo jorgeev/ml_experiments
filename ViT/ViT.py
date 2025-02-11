@@ -4,32 +4,64 @@ import torch.nn.functional as F
 from torch import einsum
 from einops import rearrange, repeat
 import numpy as np
+import math
 
 class PatchEmbedding(nn.Module):
-    def __init__(self, img_size=224, patch_size=16, in_channels=3, embed_dim=768):
+    def __init__(self, img_size=224, patch_size=16, in_channels=3, embed_dim=768, stride_percentage=0.1):
         super().__init__()
         # Handle non-square images
         if isinstance(img_size, int):
             self.img_height = self.img_width = img_size
         else:
             self.img_height, self.img_width = img_size
-            
+
         self.patch_size = patch_size
-        self.n_patches = (self.img_height // patch_size) * (self.img_width // patch_size)
-        self.proj = nn.Conv2d(in_channels, embed_dim, kernel_size=patch_size, stride=patch_size)
+        # Calculate stride for desired overlap percentage
+        # stride = patch_size * (1 - overlap)
+        # For 10% overlap (0.1), we use (1 - 0.1) = 0.9
+        self.stride = max(1, int(patch_size * (1 - stride_percentage)))  # For 10% overlap, use 90% of patch_size
+        
+        #print(f"Image size: {self.img_height}x{self.img_width}")
+        #print(f"Patch size: {patch_size}")
+        #print(f"Stride: {self.stride}")
+        #print(f"Overlap percentage: {stride_percentage*100}%")
+        #print(f"Actual overlap pixels: {patch_size - self.stride}")
+
+        # Compute number of patches using Conv2d output size formula
+        # For a given input size i, output size = floor((i - k + 2p) / s) + 1
+        # where k is kernel size, p is padding (0 in our case), and s is stride
+        self.n_patches_h = ((self.img_height - patch_size) // self.stride) + 1
+        self.n_patches_w = ((self.img_width - patch_size) // self.stride) + 1
+        self.n_patches = self.n_patches_h * self.n_patches_w
+        
+        #print(f"Number of patches: {self.n_patches} ({self.n_patches_h}x{self.n_patches_w})")
+
+        # Convolution with controlled stride
+        self.proj = nn.Conv2d(in_channels, embed_dim, kernel_size=patch_size, stride=self.stride, padding=0)
 
     def forward(self, x):
-        x = self.proj(x)  # (B, embed_dim, H/patch_size, W/patch_size)
-        x = x.flatten(2)  # (B, embed_dim, n_patches)
-        x = x.transpose(1, 2)  # (B, n_patches, embed_dim)
+        B = x.shape[0]
+        x = self.proj(x)  # Shape: (B, embed_dim, H', W')
+        x = x.flatten(2)  # Flatten spatial dimensions into sequence
+        x = x.transpose(1, 2)  # (B, num_patches, embed_dim)
+        actual_patches = x.shape[1]
+        if actual_patches != self.n_patches:
+            print(f"Warning: Actual patches ({actual_patches}) differs from computed patches ({self.n_patches})")
+            self.n_patches = actual_patches
         return x
 
 class PositionalEncoding(nn.Module):
     def __init__(self, n_patches, embed_dim):
         super().__init__()
+        #print(f"Initializing positional encoding for {n_patches} patches (plus 1 CLS token)")
         self.pos_embed = nn.Parameter(torch.zeros(1, n_patches + 1, embed_dim))
+        # Initialize the positional embeddings
+        nn.init.normal_(self.pos_embed, std=0.02)
 
     def forward(self, x):
+        B, N, D = x.shape
+        if N != self.pos_embed.shape[1]:
+            raise ValueError(f"Input sequence length ({N}) doesn't match position embedding size ({self.pos_embed.shape[1]})")
         return x + self.pos_embed
 
 class MultiHeadAttention(nn.Module):
@@ -83,7 +115,7 @@ class EncoderBlock(nn.Module):
         
 
 class Decoder(nn.Module):
-    def __init__(self, embed_dim, img_size, patch_size):
+    def __init__(self, embed_dim, img_size, patch_size, stride_percentage=0.1):
         super().__init__()
         # Handle non-square images
         if isinstance(img_size, int):
@@ -92,57 +124,77 @@ class Decoder(nn.Module):
             self.img_height, self.img_width = img_size
             
         self.patch_size = patch_size
-        self.n_patches = (self.img_height // patch_size) * (self.img_width // patch_size)
+        self.stride = max(1, int(patch_size * (1 - stride_percentage)))
         
-        # Calculate the feature map size after patch embedding
-        self.feat_height = self.img_height // patch_size
-        self.feat_width = self.img_width // patch_size
+        # Calculate feature map size using Conv2d output size formula
+        self.feat_height = ((self.img_height - patch_size) // self.stride) + 1
+        self.feat_width = ((self.img_width - patch_size) // self.stride) + 1
         
-        # Convolutional decoder layers to restore original resolution
+        # Calculate intermediate sizes for proper upsampling
+        self.sizes = self._calculate_sizes()
+        
+        # Convolutional decoder layers
         self.decoder = nn.Sequential(
             # Initial projection
             nn.Conv2d(embed_dim, 512, kernel_size=1),
             nn.BatchNorm2d(512),
             nn.ReLU(),
             
-            # Upsampling layers
-            nn.ConvTranspose2d(512, 256, kernel_size=patch_size//2, stride=patch_size//2),
+            # Progressive upsampling to ensure exact size matching
+            nn.Upsample(size=self.sizes[0], mode='bilinear', align_corners=True),
+            nn.Conv2d(512, 256, kernel_size=3, padding=1),
             nn.BatchNorm2d(256),
             nn.ReLU(),
             
-            nn.ConvTranspose2d(256, 128, kernel_size=2, stride=2),
+            nn.Upsample(size=self.sizes[1], mode='bilinear', align_corners=True),
+            nn.Conv2d(256, 128, kernel_size=3, padding=1),
             nn.BatchNorm2d(128),
             nn.ReLU(),
             
-            nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2),
+            nn.Upsample(size=self.sizes[2], mode='bilinear', align_corners=True),
+            nn.Conv2d(128, 64, kernel_size=3, padding=1),
             nn.BatchNorm2d(64),
             nn.ReLU(),
             
-            # Final layer to get single channel 
+            # Final upsampling to exact input size
+            nn.Upsample(size=(self.img_height, self.img_width), mode='bilinear', align_corners=True),
             nn.Conv2d(64, 1, kernel_size=1)
         )
+        
+    def _calculate_sizes(self):
+        """Calculate intermediate sizes for progressive upsampling"""
+        # Calculate three intermediate sizes that progressively approach the target size
+        h1 = self.feat_height * 2
+        w1 = self.feat_width * 2
+        
+        h2 = h1 * 2
+        w2 = w1 * 2
+        
+        h3 = h2 * 2
+        w3 = w2 * 2
+        
+        return [
+            (h1, w1),
+            (h2, w2),
+            (h3, w3)
+        ]
         
     def forward(self, x):
         B = x.shape[0]
         # Remove CLS token
         x = x[:, 1:]
-        # Reshape to (B, H/patch_size, W/patch_size, embed_dim)
+        # Reshape to match feature map dimensions
         x = x.reshape(B, self.feat_height, self.feat_width, -1)
-        # Convert to (B, embed_dim, H/patch_size, W/patch_size)
+        # Convert to channel-first format
         x = x.permute(0, 3, 1, 2)
-        # Pass through decoder to restore original resolution
+        # Decode
         x = self.decoder(x)
-        
-        # Ensure output size matches input size exactly
-        if x.shape[-2:] != (self.img_height, self.img_width):
-            x = F.interpolate(x, size=(self.img_height, self.img_width), mode='bilinear', align_corners=False)
-        
-        return x
+        return x  # No need for final interpolation as it's handled in the decoder
 
 class VisionTransformer(nn.Module):
-    def __init__(self, img_size=224, patch_size=16, in_channels=3, embed_dim=768, depth=12, num_heads=12, mlp_ratio=4.0, dropout=0.1):
+    def __init__(self, img_size=224, patch_size=16, in_channels=3, embed_dim=768, depth=12, num_heads=12, mlp_ratio=4.0, dropout=0.1, stride_percentage=0.1):
         super().__init__()
-        self.patch_embed = PatchEmbedding(img_size, patch_size, in_channels, embed_dim)
+        self.patch_embed = PatchEmbedding(img_size, patch_size, in_channels, embed_dim, stride_percentage)
         self.pos_embed = PositionalEncoding(self.patch_embed.n_patches, embed_dim)
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
         self.dropout = nn.Dropout(dropout)
@@ -151,7 +203,7 @@ class VisionTransformer(nn.Module):
             for _ in range(depth)
         ])
         self.norm = nn.LayerNorm(embed_dim)
-        self.decoder = Decoder(embed_dim, img_size, patch_size)
+        self.decoder = Decoder(embed_dim, img_size, patch_size, stride_percentage)
 
     def forward(self, x):
         B = x.shape[0]
@@ -165,7 +217,6 @@ class VisionTransformer(nn.Module):
             x = block(x)
 
         x = self.norm(x)
-        # Pass through decoder to get reconstructed image
         x = self.decoder(x)
         return x
 
@@ -178,6 +229,7 @@ depth = 12
 num_heads = 12
 mlp_ratio = 4.0
 dropout = 0.1
+stride_percentage = 0.1
 
 # Instantiate the model
 model = VisionTransformer(
@@ -188,7 +240,8 @@ model = VisionTransformer(
     depth=depth,
     num_heads=num_heads,
     mlp_ratio=mlp_ratio,
-    dropout=dropout
+    dropout=dropout,
+    stride_percentage=stride_percentage
 )
 
 # Example input tensor (batch_size, channels, height, width)

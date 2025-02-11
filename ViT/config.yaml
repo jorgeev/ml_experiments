@@ -1,20 +1,22 @@
 # Model parameters
 img_size: [652, 714]  # [height, width]
 patch_size: 16
-in_channels: 32
+in_channels: 31
 embed_dim: 768
 depth: 12
 num_heads: 12
 mlp_ratio: 4.0
 dropout: 0.1
-
+stride_percentage: 0.1
 # Training parameters
 batch_size: 32
-num_epochs: 100
-learning_rate: 0.0001
+num_epochs: 1000
+learning_rate: 0.001
 weight_decay: 0.05
 num_workers: 10
 resume_from: null
+early_stopping_patience: 10  # Number of epochs to wait before early stopping
+early_stopping_min_delta: 0.0001  # Minimum change in validation loss to qualify as an improvement
 
 # Optimizer parameters
 optimizer: "adamw"  # Options: "adam", "adamw"
@@ -35,6 +37,7 @@ adjust_batch_size: true
 adjust_learning_rate: true
 
 # Logging and saving
-log_dir: "/unity/g2/jvelasco/ai_outs/task21_set1/training"
-run_name: "vit_training"
-save_dir: "/unity/g2/jvelasco/ai_outs/task21_set1/checkpoints" 
+log_dir: "/unity/g2/jvelasco/ai_outs/task21_set1/training"  # Base directory for all experiments
+run_name: "vit_training"  # This will create a folder inside log_dir with this name
+# Subdirectories for logs and checkpoints will be automatically created inside run_name folder
+save_dir: "/unity/g2/jvelasco/ai_outs/task21_set1/training" 

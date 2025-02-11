@@ -30,8 +30,11 @@ class Trainer:
         if self.multi_gpu:
             print(f"Using {torch.cuda.device_count()} GPUs!")
         
-        # Initialize best_val_loss
+        # Initialize best_val_loss and early stopping parameters
         self.best_val_loss = float('inf')
+        self.patience = getattr(self.config, 'early_stopping_patience', 10)  # Default patience of 10 epochs
+        self.min_delta = getattr(self.config, 'early_stopping_min_delta', 1e-4)  # Minimum change to qualify as an improvement
+        self.counter = 0  # Counter for patience
         
         self.setup_tensorboard()
         self.setup_model()
@@ -39,8 +42,18 @@ class Trainer:
         self.setup_training()
 
     def setup_tensorboard(self):
-        # Create tensorboard writer
-        self.writer = SummaryWriter(Path(self.config.log_dir) / self.config.run_name)
+        # Create root directory for this run
+        self.run_dir = Path(self.config.log_dir) / self.config.run_name
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Create logs and checkpoints directories
+        self.logs_dir = self.run_dir / 'logs'
+        self.checkpoints_dir = self.run_dir / 'checkpoints'
+        self.logs_dir.mkdir(exist_ok=True)
+        self.checkpoints_dir.mkdir(exist_ok=True)
+        
+        # Create tensorboard writer in logs directory
+        self.writer = SummaryWriter(self.logs_dir)
         
         # Log hyperparameters
         hparams = {
@@ -62,7 +75,8 @@ class Trainer:
             depth=self.config.depth,
             num_heads=self.config.num_heads,
             mlp_ratio=self.config.mlp_ratio,
-            dropout=self.config.dropout
+            dropout=self.config.dropout,
+            stride_percentage=self.config.stride_percentage
         )
         
         # Move model to device first
@@ -96,22 +110,54 @@ class Trainer:
 
     def setup_training(self):
         # Use MSE loss for reconstruction with mask
-        def masked_mse_loss(output, target, mask):
-            # Ensure all tensors have the same size
+        def grad_mse_loss(output, target):
+
+            # Define Sobel kernels for computing gradients along x and y directions
+            sobel_kernel_x = torch.tensor([[[-1, 0, 1],
+                                            [-2, 0, 2],
+                                            [-1, 0, 1]]], dtype=output.dtype, device=output.device)
+
+            sobel_kernel_y = torch.tensor([[[-1, -2, -1],
+                                            [ 0,  0,  0],
+                                            [ 1,  2,  1]]], dtype=output.dtype, device=output.device)
+
+            # Reshape kernels to match the conv2d weight shape: [out_channels, in_channels, kH, kW]
+            sobel_kernel_x = sobel_kernel_x.unsqueeze(1)  # Shape: [1, 1, 3, 3]
+            sobel_kernel_y = sobel_kernel_y.unsqueeze(1)  # Shape: [1, 1, 3, 3]
+
+            # output = output.unsqueeze(1)  # Shape: [batch_size, 1, height, width]
+            target = target.unsqueeze(1)  # Shape: [batch_size, 1, height, width]
             if output.shape != target.shape:
                 # Resize output to match target size
                 output = F.interpolate(output, size=target.shape[-2:], mode='bilinear', align_corners=False)
-            if mask.shape[-2:] != target.shape[-2:]:
-                # Resize mask to match target size
-                mask = F.interpolate(mask, size=target.shape[-2:], mode='nearest')
+
+            #print("Inside the grad_mse_loss function")
+            #print("output.shape: ", output.shape)
+            #print("target.shape: ", target.shape)
+
+            # Compute gradients along x and y directions using conv2d
+            grad_output_x = F.conv2d(output, sobel_kernel_x, padding=1)  # Shape: [batch_size, 1, height, width]
+            grad_output_y = F.conv2d(output, sobel_kernel_y, padding=1)  # Shape: [batch_size, 1, height, width]
+
+            # Compute gradients of the target
+            grad_target_x = F.conv2d(target, sobel_kernel_x, padding=1)  # Shape: [batch_size, 1, height, width]
+            grad_target_y = F.conv2d(target, sobel_kernel_y, padding=1)  # Shape: [batch_size, 1, height, width]
+
+            # Compute the gradient magnitude (2D norm) for each element in the batch
+            grad_magnitude_output = torch.sqrt(grad_output_x ** 2 + grad_output_y ** 2)  # Shape: [batch_size, 1, height, width]
+            grad_magnitude_target = torch.sqrt(grad_target_x ** 2 + grad_target_y ** 2)  # Shape: [batch_size, 1, height, width]
+
+            # Normalize the gradients with mean 0 and std 1
+            output_gradient = (grad_magnitude_output - grad_magnitude_output.mean()) / grad_magnitude_output.std()
+            target_gradient = (grad_magnitude_target - grad_magnitude_target.mean()) / grad_magnitude_target.std()
             
-            # Apply mask to both output and target
-            loss = F.mse_loss(output * mask, target * mask, reduction='sum')
-            # Normalize by the number of valid points in the mask
-            valid_points = torch.sum(mask)
-            return loss / (valid_points + 1e-8)  # Add small epsilon to avoid division by zero
+            output_loss = F.mse_loss(output, target, reduction='sum')
+            gradient_loss = F.mse_loss(output_gradient, target_gradient, reduction='sum')
+            loss = output_loss + gradient_loss
+            
+            return loss
         
-        self.criterion = masked_mse_loss
+        self.criterion = grad_mse_loss
         
         # Setup optimizer based on config
         if self.config.optimizer.lower() == 'adam':
@@ -144,15 +190,16 @@ class Trainer:
         pbar = tqdm(self.train_loader, desc='Training')
         
         for batch_idx, (data, targets) in enumerate(pbar):
-            # Get the gulf mask from the last channel of data
-            mask = data[:, -1:, :, :].to(self.device)  # Shape: [B, 1, H, W]
-            # Remove the mask from input data
-            data = data[:, :-1, :, :].to(self.device)
+            # Send data and targets to device
+            data = data.to(self.device)
             targets = targets.to(self.device)
-            
+
             self.optimizer.zero_grad()
             outputs = self.model(data)
-            loss = self.criterion(outputs, targets, mask)
+            # print("Inside the training loop")
+            # print("outputs.shape: ", outputs.shape)
+            # print("targets.shape: ", targets.shape)
+            loss = self.criterion(outputs, targets)
             
             loss.backward()
             self.optimizer.step()
@@ -179,7 +226,7 @@ class Trainer:
                 targets = targets.to(self.device)
                 
                 outputs = self.model(data)
-                loss = self.criterion(outputs, targets, mask)
+                loss = self.criterion(outputs, targets)
                 total_loss += loss.item()
 
         return total_loss / len(self.val_loader)
@@ -193,15 +240,12 @@ class Trainer:
             'best_val_loss': self.best_val_loss
         }
         
-        save_path = Path(self.config.save_dir)
-        save_path.mkdir(parents=True, exist_ok=True)
-        
         # Save latest checkpoint
-        torch.save(checkpoint, save_path / 'latest_checkpoint.pth')
+        torch.save(checkpoint, self.checkpoints_dir / 'latest_checkpoint.pth')
         
         # Save best model
         if is_best:
-            torch.save(checkpoint, save_path / 'best_model.pth')
+            torch.save(checkpoint, self.checkpoints_dir / 'best_model.pth')
 
     def load_checkpoint(self, checkpoint_path):
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
@@ -223,6 +267,22 @@ class Trainer:
         start_epoch = checkpoint.get('epoch', 0)
         
         return start_epoch
+
+    def early_stopping_check(self, val_loss):
+        """
+        Check if training should stop based on validation loss improvement.
+        Returns True if training should stop, False otherwise.
+        """
+        if val_loss < (self.best_val_loss - self.min_delta):
+            self.best_val_loss = val_loss
+            self.counter = 0
+            return False
+        else:
+            self.counter += 1
+            if self.counter >= self.patience:
+                print(f'\nEarly stopping triggered after {self.patience} epochs without improvement.')
+                return True
+            return False
 
     def train(self):
         start_epoch = 0
@@ -252,6 +312,11 @@ class Trainer:
             if is_best:
                 self.best_val_loss = val_loss
             self.save_checkpoint(epoch, is_best)
+
+            # Early stopping check
+            if self.early_stopping_check(val_loss):
+                print(f'Training stopped at epoch {epoch+1}')
+                break
 
         # Close tensorboard writer
         self.writer.close()
