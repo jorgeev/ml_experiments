@@ -29,11 +29,8 @@ class Trainer:
         if self.multi_gpu:
             print(f"Using {torch.cuda.device_count()} GPUs!")
         
-        # Initialize best_val_loss and early stopping parameters
+        # Initialize best_val_loss
         self.best_val_loss = float('inf')
-        self.patience = getattr(self.config, 'early_stopping_patience', 10)  # Default patience of 10 epochs
-        self.min_delta = getattr(self.config, 'early_stopping_min_delta', 1e-4)  # Minimum change to qualify as an improvement
-        self.counter = 0  # Counter for patience
         
         self.setup_tensorboard()
         self.setup_model()
@@ -41,18 +38,8 @@ class Trainer:
         self.setup_training()
 
     def setup_tensorboard(self):
-        # Create root directory for this run
-        self.run_dir = Path(self.config.log_dir) / self.config.run_name
-        self.run_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Create logs and checkpoints directories
-        self.logs_dir = self.run_dir / 'logs'
-        self.checkpoints_dir = self.run_dir / 'checkpoints'
-        self.logs_dir.mkdir(exist_ok=True)
-        self.checkpoints_dir.mkdir(exist_ok=True)
-        
-        # Create tensorboard writer in logs directory
-        self.writer = SummaryWriter(self.logs_dir)
+        # Create tensorboard writer
+        self.writer = SummaryWriter(Path(self.config.log_dir) / self.config.run_name)
         
         # Log hyperparameters
         hparams = {
@@ -74,17 +61,8 @@ class Trainer:
             depth=self.config.depth,
             num_heads=self.config.num_heads,
             mlp_ratio=self.config.mlp_ratio,
-            dropout=self.config.dropout,
+            dropout=self.config.dropout
         )
-
-        # Apply Xavier Uniform Initialization
-        def init_weights(m):
-            if isinstance(m, nn.Linear) or isinstance(m, nn.Conv2d):
-                torch.nn.init.xavier_uniform_(m.weight)
-                if m.bias is not None:
-                    torch.nn.init.zeros_(m.bias)
-
-        self.model.apply(init_weights)  # Apply initialization
         
         # Move model to device first
         self.model = self.model.to(self.device)
@@ -117,17 +95,23 @@ class Trainer:
 
     def setup_training(self):
         # Use MSE loss for reconstruction with mask
-        def grad_mse_loss(output, target, mask):
-            target = target.unsqueeze(1)  # Shape: [batch_size, 1, height, width]
+        def masked_mse_loss(output, target, mask):
+            target = target.unsqueeze(1)
+            # Ensure all tensors have the same size
+            if output.shape != target.shape:
+                # Resize output to match target size
+                output = F.interpolate(output, size=target.shape[-2:], mode='bilinear', align_corners=False)
+            if mask.shape[-2:] != target.shape[-2:]:
+                # Resize mask to match target size
+                mask = F.interpolate(mask, size=target.shape[-2:], mode='nearest')
             
-            output_loss = F.mse_loss(output * mask, target * mask, reduction='sum')
-            loss =  output_loss
-
+            # Apply mask to both output and target
+            loss = F.mse_loss(output * mask, target * mask, reduction='sum')
             # Normalize by the number of valid points in the mask
-            valid_points = torch.sum(mask) + 1e-8
-            return loss / valid_points
+            valid_points = torch.sum(mask)
+            return loss / (valid_points + 1e-8)  # Add small epsilon to avoid division by zero
         
-        self.criterion = grad_mse_loss
+        self.criterion = masked_mse_loss
         
         # Setup optimizer based on config
         if self.config.optimizer.lower() == 'adam':
@@ -160,26 +144,20 @@ class Trainer:
         pbar = tqdm(self.train_loader, desc='Training')
         
         for batch_idx, (data, targets) in enumerate(pbar):
-            # Send data and targets to device
-            mask = data[:, -1, :, :].to(self.device)  # Shape: [B, 1, H, W]
+            # Get the gulf mask from the last channel of data
+            mask = data[:, -1:, :, :].to(self.device)  # Shape: [B, 1, H, W]
             # Remove the mask from input data
             data = data[:, :-1, :, :].to(self.device)
             targets = targets.to(self.device)
-
+            
             self.optimizer.zero_grad()
             outputs = self.model(data)
-            #print("outputs.shape: ", outputs.shape)
-            #exit()
             loss = self.criterion(outputs, targets, mask)
             
             loss.backward()
-            # Clip gradients to prevent exploding gradients
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1, norm_type=2)
-
             self.optimizer.step()
             
             total_loss += loss.item()
-
             
             pbar.set_postfix({
                 'loss': total_loss / (batch_idx + 1),
@@ -215,12 +193,15 @@ class Trainer:
             'best_val_loss': self.best_val_loss
         }
         
+        save_path = Path(self.config.save_dir)
+        save_path.mkdir(parents=True, exist_ok=True)
+        
         # Save latest checkpoint
-        torch.save(checkpoint, self.checkpoints_dir / 'latest_checkpoint.pth')
+        torch.save(checkpoint, save_path / 'latest_checkpoint.pth')
         
         # Save best model
         if is_best:
-            torch.save(checkpoint, self.checkpoints_dir / 'best_model.pth')
+            torch.save(checkpoint, save_path / 'best_model.pth')
 
     def load_checkpoint(self, checkpoint_path):
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
@@ -242,22 +223,6 @@ class Trainer:
         start_epoch = checkpoint.get('epoch', 0)
         
         return start_epoch
-
-    def early_stopping_check(self, val_loss):
-        """
-        Check if training should stop based on validation loss improvement.
-        Returns True if training should stop, False otherwise.
-        """
-        if val_loss < (self.best_val_loss - self.min_delta):
-            self.best_val_loss = val_loss
-            self.counter = 0
-            return False
-        else:
-            self.counter += 1
-            if self.counter >= self.patience:
-                print(f'\nEarly stopping triggered after {self.patience} epochs without improvement.')
-                return True
-            return False
 
     def train(self):
         start_epoch = 0
@@ -287,11 +252,6 @@ class Trainer:
             if is_best:
                 self.best_val_loss = val_loss
             self.save_checkpoint(epoch, is_best)
-
-            # Early stopping check
-            if self.early_stopping_check(val_loss):
-                print(f'Training stopped at epoch {epoch+1}')
-                break
 
         # Close tensorboard writer
         self.writer.close()

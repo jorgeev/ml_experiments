@@ -1,6 +1,9 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch import einsum
+from einops import rearrange, repeat
+import numpy as np
 
 class PatchEmbedding(nn.Module):
     def __init__(self, img_size=224, patch_size=16, in_channels=3, embed_dim=768):
@@ -24,8 +27,7 @@ class PatchEmbedding(nn.Module):
 class PositionalEncoding(nn.Module):
     def __init__(self, n_patches, embed_dim):
         super().__init__()
-        #self.pos_embed = nn.Parameter(torch.zeros(1, n_patches + 1, embed_dim))
-        self.pos_embed = nn.Parameter(torch.zeros(1, n_patches, embed_dim))
+        self.pos_embed = nn.Parameter(torch.zeros(1, n_patches + 1, embed_dim))
 
     def forward(self, x):
         return x + self.pos_embed
@@ -47,7 +49,6 @@ class MultiHeadAttention(nn.Module):
         q, k, v = qkv[0], qkv[1], qkv[2]
 
         attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn - attn.mean(dim=-1, keepdim=True)[0]
         attn = attn.softmax(dim=-1)
 
         x = (attn @ v).transpose(1, 2).reshape(B, N, C)
@@ -57,9 +58,9 @@ class MultiHeadAttention(nn.Module):
 class TransformerBlock(nn.Module):
     def __init__(self, embed_dim, num_heads, mlp_ratio=4.0, dropout=0.1):
         super().__init__()
-        self.norm1 = nn.LayerNorm(embed_dim, eps=1e-6)
+        self.norm1 = nn.LayerNorm(embed_dim)
         self.attn = MultiHeadAttention(embed_dim, num_heads)
-        self.norm2 = nn.LayerNorm(embed_dim, eps=1e-6)
+        self.norm2 = nn.LayerNorm(embed_dim)
         self.mlp = nn.Sequential(
             nn.Linear(embed_dim, int(embed_dim * mlp_ratio)),
             nn.GELU(),
@@ -76,9 +77,9 @@ class TransformerBlock(nn.Module):
 class EncoderBlock(nn.Module):
     def __init__(self, embed_dim, num_heads, mlp_ratio=4.0, dropout=0.1):
         super().__init__()
-        self.norm1 = nn.LayerNorm(embed_dim, eps=1e-6)
+        self.norm1 = nn.LayerNorm(embed_dim)
         self.attn = MultiHeadAttention(embed_dim, num_heads)
-        self.norm2 = nn.LayerNorm(embed_dim, eps=1e-6)
+        self.norm2 = nn.LayerNorm(embed_dim)
         
 
 class Decoder(nn.Module):
@@ -99,29 +100,32 @@ class Decoder(nn.Module):
         
         # Convolutional decoder layers to restore original resolution
         self.decoder = nn.Sequential(
-            nn.Conv2d(embed_dim, 512, kernel_size=3, stride=1, padding=1),
-            nn.LeakyReLU(0.2),
-            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),  # Smooth Upsampling
+            # Initial projection
+            nn.Conv2d(embed_dim, 512, kernel_size=1),
+            nn.BatchNorm2d(512),
+            nn.ReLU(),
             
-            nn.Conv2d(512, 256, kernel_size=3, stride=1, padding=1),
-            nn.LeakyReLU(0.2),
-            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+            # Upsampling layers
+            nn.ConvTranspose2d(512, 256, kernel_size=patch_size//2, stride=patch_size//2),
+            nn.BatchNorm2d(256),
+            nn.ReLU(),
             
-            nn.Conv2d(256, 128, kernel_size=3, stride=1, padding=1),
-            nn.LeakyReLU(0.2),
-            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+            nn.ConvTranspose2d(256, 128, kernel_size=2, stride=2),
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
             
-            nn.Conv2d(128, 64, kernel_size=3, stride=1, padding=1),
-            nn.LeakyReLU(0.2),
-            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+            nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
             
-            nn.Conv2d(64, 1, kernel_size=1)  # Single output channel
+            # Final layer to get single channel 
+            nn.Conv2d(64, 1, kernel_size=1)
         )
         
     def forward(self, x):
         B = x.shape[0]
         # Remove CLS token
-        # x = x[:, 1:]
+        x = x[:, 1:]
         # Reshape to (B, H/patch_size, W/patch_size, embed_dim)
         x = x.reshape(B, self.feat_height, self.feat_width, -1)
         # Convert to (B, embed_dim, H/patch_size, W/patch_size)
@@ -146,12 +150,14 @@ class VisionTransformer(nn.Module):
             TransformerBlock(embed_dim, num_heads, mlp_ratio, dropout)
             for _ in range(depth)
         ])
-        self.norm = nn.LayerNorm(embed_dim, eps=1e-6)
+        self.norm = nn.LayerNorm(embed_dim)
         self.decoder = Decoder(embed_dim, img_size, patch_size)
 
     def forward(self, x):
         B = x.shape[0]
         x = self.patch_embed(x)
+        cls_tokens = repeat(self.cls_token, '1 1 d -> b 1 d', b=B)
+        x = torch.cat((cls_tokens, x), dim=1)
         x = self.pos_embed(x)
         x = self.dropout(x)
 
@@ -164,7 +170,7 @@ class VisionTransformer(nn.Module):
         return x
 
 # Update these hyperparameters
-img_size = (648, 712)  # Specify both height and width
+img_size = (652, 714)  # Specify both height and width
 patch_size = 16
 in_channels = 30
 embed_dim = 768

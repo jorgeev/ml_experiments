@@ -1,7 +1,6 @@
 # For testing the dataset
 import sys
-#sys.path.append("/unity/f1/ozavala/CODE/ugos3_task21/DA_Chlora") # Only for testing purposes
-sys.path.append("/unity/g2/jvelasco/github/ugos3_task21/DA_Chlora") # Only for testing purposes
+sys.path.append("/unity/f1/ozavala/CODE/ugos3_task21/DA_Chlora") # Only for testing purposes
 import os
 import pickle
 import numpy as np
@@ -42,27 +41,6 @@ def scale_data_dataset(data, scalers, name, training=True):
     scaled_data = np.where(np.isnan(data.data), np.nan, scaled_data)
     return scaled_data, scalers
 
-# %% Simulate DUACs background field
-def groundto2background(data, lat=(14.18613, 30.61901), lon=(-89.33899, -78.666664), 
-                        x=712, y=648, resolution=0.25):
-    downsampled_lats = np.arange(lat[0], lat[1], resolution)
-    downsampled_lons = np.arange(lon[0], lon[1], resolution)
-    upsampled_lats = np.linspace(lat[0], lat[1], y)
-    upsampled_lons = np.linspace(lon[0], lon[1], x)
-
-    ds = xr.Dataset({'ssh': (['latitude', 'longitude'], data)},
-                    coords={'latitude': ('latitude', upsampled_lats),
-                            'longitude': ('longitude', upsampled_lons)})
-    ds = ds.interp(
-        latitude=downsampled_lats, 
-        longitude=downsampled_lons, 
-        method='linear').interp(
-            latitude=upsampled_lats, 
-            longitude=upsampled_lons, 
-            method='linear')
-    ds.ssh.data = np.where(np.isnan(ds.ssh.data), 0, ds.ssh.data)
-    return ds.ssh.data
-
 class SimSatelliteDataset:
     # Total 1758*2 = 3516 training examples
     # 10% validation split -> 351 examples
@@ -82,10 +60,8 @@ class SimSatelliteDataset:
         output_var = [f"{var}_normalized" for var in output_vars][0]
 
         scalers_file = "scalers.pkl"
-        # DO not delete this section it is used to select the input dataset as the computation takes some time 
         if training:
             pkl_file = "training.pkl"
-            #pkl_file = "validation.pkl"
             # pkl_file = "training_full.pkl"
             # pkl_file = "training_small.pkl"
         else:
@@ -104,9 +80,6 @@ class SimSatelliteDataset:
                     filtered_files = [f for f in all_files if pattern.match(f) and (
                         0 <= int(pattern.match(f).group(1)) <= 1582 or
                     1759 <= int(pattern.match(f).group(1)) <= 3340)]
-                elif pkl_file == "training_small.pkl":
-                    filtered_files = [f for f in all_files if pattern.match(f) and (
-                        int(pattern.match(f).group(1)) <= 100)]
                 elif pkl_file == "training_full.pkl":
                     # Use all the files
                     filtered_files = all_files
@@ -207,23 +180,23 @@ class SimSatelliteDataset:
             self.tot_inputs = self.X.shape[1] * self.previous_days + 3
         elif dataset_type == "gradient":
             # + 5 because of the Gulf Mask, and the two previous states with some noise and the gradient (2 * 2)
-            self.tot_inputs = self.X.shape[1] * self.previous_days + 3
+            self.tot_inputs = self.X.shape[1] * self.previous_days + 5
 
         # If the dataset is gradient, then we append a second output with the magnitude of the gradient of the ssh
-        # if dataset_type == "gradient":
-        #    print("Calculating the gradient of the SSH...")
-        #    all_grad_magitudes = []
-        #    for i in range(self.Y.shape[0]):
-        #        gradient_y, gradient_x = np.gradient(self.Y[i, :, :])
-        #        gradient_magnitude = np.sqrt(gradient_y**2 + gradient_x**2)
-        #        all_grad_magitudes.append(gradient_magnitude)
+        if dataset_type == "gradient":
+            print("Calculating the gradient of the SSH...")
+            all_grad_magitudes = []
+            for i in range(self.Y.shape[0]):
+                gradient_y, gradient_x = np.gradient(self.Y[i, :, :])
+                gradient_magnitude = np.sqrt(gradient_y**2 + gradient_x**2)
+                all_grad_magitudes.append(gradient_magnitude)
 
-        #    all_grad_magitudes = np.array(all_grad_magitudes)
-        #    # Normalize to mean 0 and std 1
-        #    all_grad_magitudes = (all_grad_magitudes - np.mean(all_grad_magitudes)) / np.std(all_grad_magitudes)
-        #    self.Y = np.stack([self.Y, all_grad_magitudes], axis=0)
-        #    # Flip the first and second dimensions in Y
-        #    self.Y = np.transpose(self.Y, (1, 0, 2, 3))
+            all_grad_magitudes = np.array(all_grad_magitudes)
+            # Normalize to mean 0 and std 1
+            all_grad_magitudes = (all_grad_magitudes - np.mean(all_grad_magitudes)) / np.std(all_grad_magitudes)
+            self.Y = np.stack([self.Y, all_grad_magitudes], axis=0)
+            # Flip the first and second dimensions in Y
+            self.Y = np.transpose(self.Y, (1, 0, 2, 3))
 
         # Make the mask a float32 tensor
         self.gulf_mask = torch.tensor(self.gulf_mask, dtype=torch.float32)
@@ -231,8 +204,6 @@ class SimSatelliteDataset:
         # Get the length of the dataset
         self.length = self.Y.shape[0]
         if self.dataset_type == "extended":
-            self.length = self.length - 2
-        if self.dataset_type == "gradient":
             self.length = self.length - 2
 
         # # Verify the dimensions
@@ -271,21 +242,21 @@ class SimSatelliteDataset:
 
         if self.dataset_type == "gradient":
             noise_level_ssh = 0.2
-            noise_ssh = np.random.randn(self.Y.shape[1],self.Y.shape[2]) * noise_level_ssh
+            noise_level_gradient = 0.2
+            noise_ssh = np.random.randn(self.Y.shape[2],self.Y.shape[3]) * noise_level_ssh
+            noise_gradient = np.random.randn(self.Y.shape[2],self.Y.shape[3]) * noise_level_gradient
             # Add the previous two states with some noise and its gradient
-            X_with_mask[-2, :, :] = self.Y[index-1, :, :] + noise_ssh
-            X_with_mask[-3, :, :] = self.Y[index-2, :, :] + noise_ssh
-            #X_with_mask[-2, :, :] = torch.tensor(groundto2background(self.Y[index-1, :, :].clone()).copy(), dtype=torch.float32)
-            #X_with_mask[-3, :, :] = torch.tensor(groundto2background(self.Y[index-2, :, :].clone()).copy(), dtype=torch.float32)
-
+            X_with_mask[-2, :, :] = self.Y[index-1, 0, :, :] + noise_ssh
+            X_with_mask[-3, :, :] = self.Y[index-1, 1, :, :] + noise_gradient
+            X_with_mask[-4, :, :] = self.Y[index-2, 0, :, :] + noise_ssh
+            X_with_mask[-5, :, :] = self.Y[index-2, 1, :, :] + noise_gradient
 
 
         # Only for testing purposes plot the input data
         if self.plot_data:
             input_names = ["sst", "chlora", "ssh_track", "swot"]
             plot_single_batch_element(X_with_mask, self.Y[index], input_names, self.previous_days, 
-                                      #f"/unity/f1/ozavala/OUTPUTS/HR_SSH_from_Chlora/trainings/batch_example_{index}.jpg",
-                                      f"/unity/g2/jvelasco/ai_outs/task21_set1/higos/batch_example_{index}.jpg",
+                                      f"/unity/f1/ozavala/OUTPUTS/HR_SSH_from_Chlora/trainings/batch_example_{index}.jpg",
                                       self.lats, self.lons, dataset_type=self.dataset_type)
 
         return X_with_mask, self.Y[index]
@@ -302,7 +273,7 @@ class SimSatelliteDataset:
 
 if __name__ == "__main__":
 # Main function to test the dataset
-    data_dir = "/Net/work/ozavala/OUTPUTS/HR_SSH_from_Chlora/training_data"
+    data_dir = "/unity/f1/ozavala/OUTPUTS/HR_SSH_from_Chlora/training_data"
     batch_size = 1
     training = False
     plot_data = True

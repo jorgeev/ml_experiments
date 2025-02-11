@@ -1,0 +1,40 @@
+# Model parameters
+img_size: [652, 714]  # [height, width]
+patch_size: 16
+in_channels: 30
+embed_dim: 768
+depth: 12
+num_heads: 12
+mlp_ratio: 4.0
+dropout: 0.1
+
+# Training parameters
+batch_size: 32
+num_epochs: 100
+learning_rate: 0.0001
+weight_decay: 0.05
+num_workers: 10
+resume_from: null
+
+# Optimizer parameters
+optimizer: "adamw"  # Options: "adam", "adamw"
+adam_beta1: 0.9
+adam_beta2: 0.999
+adam_epsilon: 1.0e-8
+
+# Dataset parameters
+previous_days: 7
+dataset_type: "gradient"  # Options: "regular", "extended", "gradient"
+
+# Data paths
+train_data_dir: "/unity/f1/ozavala/OUTPUTS/HR_SSH_from_Chlora/training_data"
+val_data_dir: "/unity/f1/ozavala/OUTPUTS/HR_SSH_from_Chlora/training_data"
+
+# Multi-GPU settings
+adjust_batch_size: true
+adjust_learning_rate: true
+
+# Logging and saving
+log_dir: "/unity/g2/jvelasco/ai_outs/task21_set1/"
+run_name: "vitraw_training_debug"
+save_dir: "/unity/g2/jvelasco/ai_outs/task21_set1/vitraw_training_debug/checkpoints" 

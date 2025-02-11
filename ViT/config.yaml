@@ -1,22 +1,22 @@
 # Model parameters
-img_size: [652, 714]  # [height, width]
+img_size: [648, 712]  # [height, width]
 patch_size: 16
-in_channels: 31
-embed_dim: 768
+in_channels: 30 # 30 since the mask is not evaluated in transformer
+embed_dim: 768 # Must be divisible by num_heads (12) and also divisible by patch_size (8)
 depth: 12
 num_heads: 12
 mlp_ratio: 4.0
-dropout: 0.1
-stride_percentage: 0.1
+dropout: 0.0
+
 # Training parameters
 batch_size: 32
 num_epochs: 1000
-learning_rate: 0.001
+learning_rate: 0.0001
 weight_decay: 0.05
 num_workers: 10
-resume_from: null
+resume_from: null # "checkpoints/epoch_100.pth"
 early_stopping_patience: 10  # Number of epochs to wait before early stopping
-early_stopping_min_delta: 0.0001  # Minimum change in validation loss to qualify as an improvement
+early_stopping_min_delta: 0.00001  # Minimum change in validation loss to qualify as an improvement
 
 # Optimizer parameters
 optimizer: "adamw"  # Options: "adam", "adamw"
@@ -38,6 +38,6 @@ adjust_learning_rate: true
 
 # Logging and saving
 log_dir: "/unity/g2/jvelasco/ai_outs/task21_set1/training"  # Base directory for all experiments
-run_name: "vit_training"  # This will create a folder inside log_dir with this name
+run_name: "vit_nograd"  # This will create a folder inside log_dir with this name
 # Subdirectories for logs and checkpoints will be automatically created inside run_name folder
 save_dir: "/unity/g2/jvelasco/ai_outs/task21_set1/training" 

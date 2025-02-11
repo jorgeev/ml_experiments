@@ -85,7 +85,6 @@ class SimSatelliteDataset:
         # DO not delete this section it is used to select the input dataset as the computation takes some time 
         if training:
             pkl_file = "training.pkl"
-            #pkl_file = "validation.pkl"
             # pkl_file = "training_full.pkl"
             # pkl_file = "training_small.pkl"
         else:
