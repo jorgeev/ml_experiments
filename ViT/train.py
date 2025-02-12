@@ -31,6 +31,7 @@ class Trainer:
         
         # Initialize best_val_loss and early stopping parameters
         self.best_val_loss = float('inf')
+        self.last_improvement = float('inf')  # For early stopping tracking
         self.patience = getattr(self.config, 'early_stopping_patience', 10)  # Default patience of 10 epochs
         self.min_delta = getattr(self.config, 'early_stopping_min_delta', 1e-4)  # Minimum change to qualify as an improvement
         self.counter = 0  # Counter for patience
@@ -126,9 +127,13 @@ class Trainer:
             # Normalize by the number of valid points in the mask
             valid_points = torch.sum(mask) + 1e-8
             return loss / valid_points
+
+        def tv_loss(x):
+            return torch.mean(torch.abs(x[:, :, :, :-1] - x[:, :, :, 1:])) + \
+                              torch.mean(torch.abs(x[:, :, :-1, :] - x[:, :, 1:, :]))
         
         self.criterion = grad_mse_loss
-        
+        self.tv_loss = tv_loss
         # Setup optimizer based on config
         if self.config.optimizer.lower() == 'adam':
             self.optimizer = optim.Adam(
@@ -168,9 +173,8 @@ class Trainer:
 
             self.optimizer.zero_grad()
             outputs = self.model(data)
-            #print("outputs.shape: ", outputs.shape)
-            #exit()
-            loss = self.criterion(outputs, targets, mask)
+
+            loss = self.criterion(outputs, targets, mask) + self.tv_loss(outputs)
             
             loss.backward()
             # Clip gradients to prevent exploding gradients
@@ -179,7 +183,6 @@ class Trainer:
             self.optimizer.step()
             
             total_loss += loss.item()
-
             
             pbar.set_postfix({
                 'loss': total_loss / (batch_idx + 1),
@@ -201,7 +204,7 @@ class Trainer:
                 targets = targets.to(self.device)
                 
                 outputs = self.model(data)
-                loss = self.criterion(outputs, targets, mask)
+                loss = self.criterion(outputs, targets, mask) + self.tv_loss(outputs)
                 total_loss += loss.item()
 
         return total_loss / len(self.val_loader)
@@ -212,7 +215,9 @@ class Trainer:
             'state_dict': self.model.module.state_dict() if self.multi_gpu else self.model.state_dict(),
             'optimizer': self.optimizer.state_dict(),
             'scheduler': self.scheduler.state_dict() if self.scheduler else None,
-            'best_val_loss': self.best_val_loss
+            'best_val_loss': self.best_val_loss,
+            'last_improvement': self.last_improvement,
+            'counter': self.counter
         }
         
         # Save latest checkpoint
@@ -238,22 +243,40 @@ class Trainer:
         if checkpoint['scheduler'] and self.scheduler:
             self.scheduler.load_state_dict(checkpoint['scheduler'])
             
+        # Load training state
         self.best_val_loss = checkpoint.get('best_val_loss', float('inf'))
+        self.last_improvement = checkpoint.get('last_improvement', float('inf'))
+        self.counter = checkpoint.get('counter', 0)
         start_epoch = checkpoint.get('epoch', 0)
         
         return start_epoch
 
+    def update_best_model(self, val_loss, epoch):
+        """
+        Handle best model tracking and saving.
+        Returns whether this was the best model so far.
+        """
+        is_best = val_loss < self.best_val_loss
+        if is_best:
+            self.best_val_loss = val_loss
+            print(f"New best validation loss: {val_loss}")
+        self.save_checkpoint(epoch, is_best)
+        return is_best
+
     def early_stopping_check(self, val_loss):
         """
         Check if training should stop based on validation loss improvement.
+        Uses a separate variable (last_improvement) for early stopping tracking.
         Returns True if training should stop, False otherwise.
         """
-        if val_loss < (self.best_val_loss - self.min_delta):
-            self.best_val_loss = val_loss
+        if val_loss < (self.last_improvement - self.min_delta):
+            # print(f"Validation loss improved for early stopping from {self.last_improvement} to {val_loss}")
+            self.last_improvement = val_loss
             self.counter = 0
             return False
         else:
             self.counter += 1
+            # print(f"Early stopping counter: {self.counter} out of {self.patience}")
             if self.counter >= self.patience:
                 print(f'\nEarly stopping triggered after {self.patience} epochs without improvement.')
                 return True
@@ -265,6 +288,7 @@ class Trainer:
         if hasattr(self.config, 'resume_from') and self.config.resume_from:
             print(f"Resuming from checkpoint: {self.config.resume_from}")
             start_epoch = self.load_checkpoint(self.config.resume_from)
+            self.last_improvement = self.best_val_loss  # Initialize last_improvement from checkpoint
 
         for epoch in range(start_epoch, self.config.num_epochs):
             print(f'\nEpoch: {epoch+1}/{self.config.num_epochs}')
@@ -282,13 +306,9 @@ class Trainer:
                 self.scheduler.get_last_lr()[0] if self.scheduler else self.config.learning_rate, 
                 epoch)
             
-            # Save checkpoint
-            is_best = val_loss < self.best_val_loss
-            if is_best:
-                self.best_val_loss = val_loss
-            self.save_checkpoint(epoch, is_best)
-
-            # Early stopping check
+            # Handle both best model tracking and early stopping independently
+            self.update_best_model(val_loss, epoch)
+            
             if self.early_stopping_check(val_loss):
                 print(f'Training stopped at epoch {epoch+1}')
                 break

@@ -128,7 +128,6 @@ class Decoder(nn.Module):
         x = x.permute(0, 3, 1, 2)
         # Pass through decoder to restore original resolution
         x = self.decoder(x)
-        
         # Ensure output size matches input size exactly
         if x.shape[-2:] != (self.img_height, self.img_width):
             x = F.interpolate(x, size=(self.img_height, self.img_width), mode='bilinear', align_corners=False)
